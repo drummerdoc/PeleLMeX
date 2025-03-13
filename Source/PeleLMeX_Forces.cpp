@@ -247,13 +247,38 @@ PeleLM::addScalarDissipation(const TimeStamp& a_timestamp)
   amrex::ignore_unused(a_timestamp);
 #else
 
+
+  //------------------------------------------------------------------------
+  // Compute scalar gradients and do average down to get gradients consistent across
+  // levels Get the scalar BCRec
+  int do_avgDown = 0;
+  int SCALAR = -2; // FIXME
+  auto bcRecScalar = fetchBCRecArray(SCALAR, 1);
+
+  int nGrow = 0; // No need for ghost face on fluxes
+  Vector<Array<MultiFab, AMREX_SPACEDIM>> grad_fc(finest_level + 1);
+  for (int lev = 0; lev <= finest_level; ++lev) {
+    const auto& ba = grids[lev];
+    const auto& factory = Factory(lev);
+    for (int idim = 0; idim < AMREX_SPACEDIM; idim++) {
+      grad_fc[lev][idim].define(
+        amrex::convert(ba, IntVect::TheDimensionVector(idim)), dmap[lev], 1,
+        nGrow, MFInfo(), factory);
+      grad_fc[lev][idim].setVal(0.0); // Required?
+    }
+  }
+
+  getDiffusionOp()->computeGradient(
+    GetVecOfArrOfPtrs(grad_fc), {}, // Don't need the laplacian out
+    GetVecOfConstPtrs(getStateVect(a_timestamp)), {}, bcRecScalar[SCALAR], do_avgDown, SCALAR);
+
   // Dissipation source term for subfilter variances
   for (int lev = 0; lev <= finest_level; lev++) {
 
     auto* ldata_p = getLevelDataPtr(lev, a_timestamp);
     auto const& leosparm = eos_parms.host_parm();
 
-    // For now - we require the turbulent viscosity to be pre-computed
+    // Require the turbulent viscosity to be pre-computed
     // it always is stored at AmrOldTime, so we just use that
     // We need cell-centered mu_t but have it at faces
     // The simple interpolation below probably isn't valid for EB
@@ -262,22 +287,24 @@ PeleLM::addScalarDissipation(const TimeStamp& a_timestamp)
       "PeleLM::addScalarDissipation(): this is not supported with EB");
 #endif
 
-    for (int n = 0; n < MANIFOLD_DIM; ++n) {
+    for (int n = 0; n < MANIFOLD_DIM; ++n) { // FIXME
       if (leosparm.is_variance_of[n] >= 0) {
         if (!m_do_les) {
           amrex::Abort("PeleLM::addScalarDissipation(): cannot add a "
                        "scalarDissipation without an active LES model");
         }
 
-        constexpr amrex::Real fact = 0.5 / AMREX_SPACEDIM;
         const amrex::Real C_chi = m_les_c_chi;
 
-        AMREX_D_TERM(auto const& mut_arr_x =
+        AMREX_D_TERM(auto const& Dx =
                        m_leveldata_old[lev]->visc_turb_fc[0].const_arrays();
-                     , auto const& mut_arr_y =
+                     , auto const& Dy =
                          m_leveldata_old[lev]->visc_turb_fc[1].const_arrays();
-                     , auto const& mut_arr_z =
+                     , auto const& Dz =
                          m_leveldata_old[lev]->visc_turb_fc[2].const_arrays();)
+        AMREX_D_TERM(auto const&   gx = grad_fc[lev][0].arrays();
+                     , auto const& gy = grad_fc[lev][1].arrays();
+                     , auto const& gz = grad_fc[lev][2].arrays();)
         auto extma = m_extSource[lev]->arrays();
         auto statema = ldata_p->state.const_arrays();
 
@@ -291,25 +318,36 @@ PeleLM::addScalarDissipation(const TimeStamp& a_timestamp)
 
         amrex::ParallelFor(
           *m_extSource[lev],
-          [=] AMREX_GPU_DEVICE(int box_no, int i, int j, int k) noexcept {
-            amrex::Real mu_t =
-              fact *
+          [=] AMREX_GPU_DEVICE(int bx, int i, int j, int k) noexcept {
+            amrex::Real mu_t = 0.25 *
               (AMREX_D_TERM(
-                mut_arr_x[box_no](i, j, k) + mut_arr_x[box_no](i + 1, j, k),
-                +mut_arr_y[box_no](i, j, k) + mut_arr_y[box_no](i, j + 1, k),
-                +mut_arr_z[box_no](i, j, k) + mut_arr_z[box_no](i, j, k + 1)));
+                ( Dx[bx](i,j,k)+Dx[bx](i+1,j,k))*(gx[bx](i,j,k)+gx[bx](i+1,j,k)),
+                *(Dy[bx](i,j,k)+Dy[bx](i,j+1,k))*(gy[bx](i,j,k)+gy[bx](i,j+1,k)),
+                *(Dz[bx](i,j,k)+Dz[bx](i,j,k+1))*(gz[bx](i,j,k)+gz[bx](i,j,k+1))));
 
             // Linear Relaxation model
             // rho chi_sgs = C_chi * mu_t / Delta^2 * Variance
-            extma[box_no](i, j, k, FIRSTSPEC + n) -=
+            extma[bx](i, j, k, FIRSTSPEC + n) -=
               C_chi * mu_t * inv_l_scale2 *
-              statema[box_no](i, j, k, FIRSTSPEC + n);
+              statema[bx](i, j, k, FIRSTSPEC + n);
           });
       }
     }
     Gpu::streamSynchronize();
   }
 
+  // Average down source term
+  for (int lev = finest_level; lev > 0; --lev) {
+#ifdef AMREX_USE_EB
+    EB_average_down(
+      *m_extSource[lev], *m_extSource[lev-1], 0, MANIFOLD_DIM, refRatio(lev - 1));
+#else
+    average_down(
+      *m_extSource[lev], *m_extSource[lev-1], 0, MANIFOLD_DIM, refRatio(lev - 1));
+#endif
+  }
+
+  
 #endif
 }
 
