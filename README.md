@@ -72,7 +72,7 @@ The preferred method consists of cloning *PeleLMeX* and its submodules
 [SUNDIALS](https://github.com/LLNL/sundials) using a recursive `git clone`:
 
 ```
-git clone --recursive --shallow-submodules --single-branch https://github.com/AMReX-Combustion/PeleLMeX.git
+git clone --recursive --shallow-submodules --single-branch git@github.com:drummerdoc/PeleLMeX.git
 ```
 
 The `--shallow-submodules` and `--single-branch` flags are recommended for most users as they substantially reduce the size of the download by
