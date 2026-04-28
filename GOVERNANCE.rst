@@ -62,6 +62,7 @@ Current Roster
 - Marc Day
 - Weiqun Zhang
 - Thomas Howarth
+- David Montgomery
 - Marc Henry de Frahan
 - Anne Felden
 - Bruno Savard
