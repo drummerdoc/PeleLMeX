@@ -128,14 +128,14 @@ Role
 
 Members of the advsiory panel (AP) are encouraged to provide regular recommendations to the TC for the future directions of the Pele Suite, in terms of suggested infrastructure capabilities, physical/modeled processes incorporated within the Suite, validation/verification activities, etc, to maximize the scientific and industrial impact of the software.
 
-The SC and TP will regularly poll the AP via Email 1-2 times per year for updates to recommended Pele development activity. Any recommendations by the AP should be shared publicly and documented in GitHub. The TP should respond to the AP to report on the feasibility of suggestions, plans for implementation, and a summary of the status of previous suggestions.
+The SC and TC will regularly poll the AP via Email 1-2 times per year for updates to recommended Pele development activity. Any recommendations by the AP should be shared publicly and documented in GitHub. The TC should respond to the AP to report on the feasibility of suggestions, plans for implementation, and a summary of the status of previous suggestions.
 
 Decision Process
 ^^^^^^^^^^^^^^^^
 
-Input from the AP is usually gathered via e-mail or public chat and forwarded to the TP for consideration and response (see above).
+Input from the AP is usually gathered via e-mail or public chat and forwarded to the TC for consideration and response (see above).
 
-Group input from the AP is made in a non-confidential manner by the majority of votes cast by AP members. Such input should be addressed by the TP, as outlined above.
+Group input from the AP is made in a non-confidential manner by the majority of votes cast by AP members. Such input should be addressed by the TC, as outlined above.
 
 AP input can be gathered asynchronously, e.g., over a time period of 1-2 weeks.
 
