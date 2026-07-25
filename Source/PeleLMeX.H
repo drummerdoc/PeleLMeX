@@ -10,6 +10,14 @@
 #include "DiagBase.H"
 #include "PeleLMeX_FlowControllerData.H"
 #include "PeleLMeX_BPatch.H"
+#include "PeleLMeX_MeshMap.H"
+#include "PeleLMeX_MeshMappedCellConsInterp.H"
+
+#ifdef AMREX_USE_ASCENT
+#include <AMReX_Conduit_Blueprint.H>
+#include <ascent.hpp>
+#include "PeleLMeX_Ascent.H"
+#endif
 
 #ifdef PELE_USE_PLASMA
 #include "PrecondOp.H"
@@ -74,6 +82,10 @@ public:
 
   // Simulation function
   void Evolve();
+
+#ifdef AMREX_USE_ASCENT
+  void doInSituViz();
+#endif
 
   // Unit Test function
   void Evaluate();
@@ -1074,7 +1086,8 @@ public:
 
   //-----------------------------------------------------------------------------
   // BOUNDARY CONDITIONS / FILLPATCH
-  amrex::InterpBase* getInterpolator(const int a_method = 1) const;
+  amrex::InterpBase*
+  getInterpolator(const int a_method = 1, const int a_crse_level = -1) const;
 
   // Interpolation method for regrid (default to cell cons interp)
   int m_regrid_interp_method = 1;
@@ -1218,10 +1231,29 @@ public:
     const int lev,
     const amrex::Real a_time);
 
+  void fillFromRecyclingPlane(amrex::MultiFab& a_vel, int vel_comp, int lev);
+
+  // (Re)build per-level thin-slab storage for the recycling plane.
+  void buildRecyclingPlaneStorage();
+  // Sample state at the recycling plane, update running mean and store the
+  // current fluctuation. Should be called once per coarse step after the new
+  // velocity is available.
+  void updateRecyclingPlaneSnapshot();
+  // Cell-centered index of the recycling plane on level `lev`.
+  int computeRecyclingSrcIndex(int lev) const;
+  // If dt>=m_inlet_plane_avg_window, the injected fluctions will be
+  // approximately zero, warn user every step this happens
+  bool m_warned_clipped_recycle_avg_window_this_step;
+
   // Average down operations
   void averageDownState(const PeleLM::TimeStamp a_time);
   void averageDownScalars(const PeleLM::TimeStamp a_time);
   void averageDownVelocity(const PeleLM::TimeStamp a_time);
+  //! detJ-weighted (volume-conservative) restriction of the conserved
+  //! density block [DENSITY..RHOH] (rho, rhoY, rhoH) under mesh mapping.
+  //! Derived TEMP/RHORT are not touched; recompute via setTemperature /
+  //! setThermoPress afterward.
+  void averageDownConservedDensities(const PeleLM::TimeStamp a_time);
   void averageDownAux(const PeleLM::TimeStamp a_time);
   void averageDown(
     const PeleLM::TimeStamp a_time, const int state_comp, const int ncomp);
@@ -1396,6 +1428,12 @@ public:
 
   amrex::Real
   MFSum(const amrex::Vector<const amrex::MultiFab*>& a_MF, const int comp);
+  //! Physical-domain volume integral of a cell-centered field.  Same as
+  //! MFSum without mesh mapping; with it, detJ-weights each cell to give
+  //! the true physical integral (e.g. mass = integral of rho), so the
+  //! balance telescopes to the Xi-space boundary fluxes in addMassFluxes.
+  amrex::Real MFSumMapped(
+    const amrex::Vector<const amrex::MultiFab*>& a_MF, const int comp);
   static amrex::Real MFmax(
     const amrex::MultiFab* a_MF,
     const amrex::iMultiFab& a_mask,
@@ -1799,6 +1837,7 @@ public:
   amrex::Vector<amrex::BCRec> fetchBCRecArray(const int scomp, const int ncomp);
   amrex::Vector<amrex::BCRec>
   fetchBCRecAuxArray(const int scomp, const int ncomp);
+  amrex::Vector<amrex::BCRec> fetchBCRecDummyArray(const int ncomp);
   amrex::Vector<int> fetchAdvTypeArray(const int scomp, const int ncomp);
   amrex::Vector<int> fetchDiffTypeArray(const int scomp, const int ncomp);
   amrex::Vector<int> fetchAdvTypeAuxArray(const int scomp, const int ncomp);
@@ -1852,6 +1891,44 @@ public:
   amrex::BCRec m_bcrec_divu;
   amrex::Vector<amrex::BCRec> m_bcrec_force;
   amrex::Vector<amrex::BCRec> m_bcrec_aux;
+  amrex::BCRec m_bcrec_dummy;
+
+  // Recycling-plane inflow controls (see fillFromRecyclingPlane).
+  // Recycling injects a zero-mean fluctuation onto the inflow ghost cells:
+  //   u_inlet(t) = u_inlet_target_mean + [u_src(t) - <u_src>]
+  // The standard ext_dir BC continues to set u_inlet_target_mean; this
+  // machinery only supplies the bracketed fluctuation.
+  int m_use_inlet_from_plane = 0;
+  int m_inlet_plane_dir = -1;
+  amrex::Real m_inlet_plane_position = 0.0;
+  // Time-averaging window (in simulation time units) for the running source-
+  // plane mean. <=0 falls back to a cumulative average.
+  amrex::Real m_inlet_plane_avg_window = -1.0;
+  // Number of recycling-plane samples to accumulate before injecting any
+  // fluctuation (lets the running mean settle).
+  int m_inlet_plane_warmup_steps = 0;
+  // Set to 1 whenever per-level thin-slab storage needs to be rebuilt
+  // (initialization, regrid). Consumed by updateRecyclingPlaneSnapshot.
+  bool m_recycling_needs_rebuild = true;
+
+  // Per-level thin-slab storage for the recycling plane: one cell thick along
+  // m_inlet_plane_dir, spanning the full transverse cross-section at the
+  // source-plane index for that level's resolution.
+  struct RecyclingPlaneData
+  {
+    amrex::Vector<std::unique_ptr<amrex::MultiFab>> u_src;     // current
+    amrex::Vector<std::unique_ptr<amrex::MultiFab>> mean_src;  // running mean
+    amrex::Vector<std::unique_ptr<amrex::MultiFab>> fluct_src; // u_src - mean
+#ifdef AMREX_USE_EB
+    // Per-cell mask on the slab: 1 = regular or cut (sampled into the mean
+    // and fluctuation), 0 = EB-covered (excluded). Always rebuilt with the
+    // slab storage; not persisted in checkpoints.
+    amrex::Vector<std::unique_ptr<amrex::iMultiFab>> mask;
+#endif
+    int n_samples = 0;
+    bool initialized = false;
+  };
+  RecyclingPlaneData m_inlet_recycling;
 
   // Advection/Diffusion types
   amrex::Vector<int>
@@ -1920,6 +1997,10 @@ public:
   amrex::Vector<amrex::Real> m_ctrl_time_pts;
   amrex::Vector<amrex::Real> m_ctrl_velo_pts;
   amrex::Vector<amrex::Real> m_ctrl_cntl_pts;
+  // Time-integrated controlled inlet velocity (physical convected distance).
+  // Used to march through the turbulent-inflow data consistently with the
+  // controller. Reconstructed from AC history on restart.
+  amrex::Real m_turb_conv_dist{0.0};
 
   // PMF parameters
   pele::physics::PeleParams<pele::physics::PMF::PmfData::DataContainer>
@@ -1973,6 +2054,10 @@ public:
   int m_plotHeatRelease = 0;
   int m_plotStateSpec = 0;
   int m_plot_int = 0;
+
+#ifdef AMREX_USE_ASCENT
+  pele::PeleLMeXAscent m_ascent;
+#endif
   bool m_plot_overwrite = false;
   bool m_plot_init_state = false;
   int m_plot_zeroEBcovered = 1;
@@ -2246,6 +2331,59 @@ public:
   std::unique_ptr<Hydro::MacProjector> macproj;
   int m_macProjNeedReset{0};
   int m_macProjOldSize{0};
+
+  //-----------------------------------------------------------------------------
+  // Mesh mapping (optional single-block, axis-aligned stretched mesh).
+  // Controlled via the "geometry.mesh_mapping" input; when absent,
+  // m_mesh_map remains null and all metric-field machinery is bypassed.
+  std::unique_ptr<MeshMap> m_mesh_map;
+  bool m_mesh_mapping{false};
+
+  // Cached device-callable evaluator for the active mesh mapping.  See
+  // PeleLMeX_MeshMapEvaluator.H.  Defaults to Kind::Identity when no
+  // mapping is active; refreshed from m_mesh_map->make_evaluator()
+  // whenever the mapping is (re)created (Init and Regrid paths).  This
+  // is the conduit used by user initdata_mapped / bcnormal code to
+  // obtain physical-space coordinates without having to know which
+  // concrete map is active.
+  MeshMapEvaluator m_map_eval{};
+
+  // When true (and mesh mapping is active), WritePlotFile emits a
+  // nodal-displacement MultiFab alongside the cell-centered state so
+  // visualization tools can render the solution on the curvilinear
+  // physical grid rather than on the Xi-space AMReX grid when the
+  // plotfile metadata is recognized by the reader/plugin.
+  // Disable via `peleLM.plot_mesh_mapping = 0` to always write the
+  // standard Xi-space plotfile format.
+  int m_plot_mesh_mapping{1};
+
+  // Mapping-aware state interpolators, one per coarse/fine pair
+  // (m_mapped_interps[c] does level c -> c+1), rebuilt on level-lifecycle
+  // events.  Whole-state fillpatch helpers select one by passing the
+  // coarse level to getInterpolator(); other sites use the legacy interp.
+  amrex::Vector<std::unique_ptr<MeshMappedCellConsInterp>> m_mapped_interps;
+
+  //! Rebuild m_mapped_interps after a level lifecycle event (no-op if
+  //! mesh mapping is disabled).
+  void rebuildMappedInterps();
+
+  //! Access the MeshMap instance (nullptr if mesh mapping is disabled).
+  MeshMap* meshMap() noexcept { return m_mesh_map.get(); }
+  [[nodiscard]] const MeshMap* meshMap() const noexcept
+  {
+    return m_mesh_map.get();
+  }
+  [[nodiscard]] bool hasMeshMapping() const noexcept { return m_mesh_mapping; }
+
+  //! Cached device-callable physical-coordinate evaluator (Identity
+  //! when no mesh mapping is active).
+  [[nodiscard]] const MeshMapEvaluator& meshMapEvaluator() const noexcept
+  {
+    return m_map_eval;
+  }
+
+private:
+  //-----------------------------------------------------------------------------
 
   // Nodal projection
   int m_nodal_mg_max_coarsening_level = 100;

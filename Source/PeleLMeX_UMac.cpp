@@ -239,6 +239,62 @@ PeleLM::macProject(
     Sbar = adjustPandDivU(advData);
   }
 
+  //-------------------------------------------------------------------
+  // Mesh-mapping scaling (MAC projection).  Solves
+  //     div_Xi . ( beta grad phi ) = div_Xi . u_bar - J.S
+  // with u_bar_i = (J/fac_i) u_i on face i and
+  //      beta_i = (dt/2) . J / (fac_i^2 . rho) on face i.
+  // Per the amr-wind convention, umac enters macProject in physical
+  // space and leaves in uniform (Xi) space -- the scaling applied here
+  // is NOT undone on exit.  Downstream consumers of umac must be aware
+  // (see computeVelocityAdvTerm in PeleLMeX_Advection.cpp).
+  //   amr-wind/docs/sphinx/theory/mapping.rst  (MAC projection section)
+  //   amr-wind/equation_systems/icns/icns_advection.cpp ::
+  //   mac_proj_to_uniform_space
+  //
+  // The caller-owned a_divu is NOT modified; a scratch MF holding
+  // (J . divU) is built and passed to setDivU instead, so the caller's
+  // divU remains in physical space across the call.
+  //-------------------------------------------------------------------
+  amrex::Vector<amrex::MultiFab> scaled_divu;
+  amrex::Vector<const amrex::MultiFab*> divu_for_proj;
+  if (m_mesh_mapping) {
+    for (int lev = 0; lev <= finest_level; ++lev) {
+      for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+        const auto& fac_ma = m_mesh_map->fac_fc(lev, idim).const_arrays();
+        const auto& detJ_ma = m_mesh_map->detJ_fc(lev, idim).const_arrays();
+        const auto& umac_ma = advData->umac[lev][idim].arrays();
+        const auto& rhoinv_ma = rho_inv[lev][idim].arrays();
+        const int nc = idim;
+        amrex::ParallelFor(
+          advData->umac[lev][idim],
+          [=] AMREX_GPU_DEVICE(int box_no, int i, int j, int k) noexcept {
+            const amrex::Real f = fac_ma[box_no](i, j, k, nc);
+            const amrex::Real dJ = detJ_ma[box_no](i, j, k);
+            umac_ma[box_no](i, j, k) *= dJ / f;
+            rhoinv_ma[box_no](i, j, k) *= dJ / (f * f);
+          });
+      }
+    }
+    amrex::Gpu::streamSynchronize();
+
+    if (has_divu != 0) {
+      scaled_divu.resize(finest_level + 1);
+      divu_for_proj.resize(finest_level + 1);
+      for (int lev = 0; lev <= finest_level; ++lev) {
+        scaled_divu[lev].define(
+          a_divu[lev]->boxArray(), a_divu[lev]->DistributionMap(), 1,
+          a_divu[lev]->nGrow(), amrex::MFInfo(), a_divu[lev]->Factory());
+        amrex::MultiFab::Copy(
+          scaled_divu[lev], *a_divu[lev], 0, 0, 1, a_divu[lev]->nGrow());
+        amrex::MultiFab::Multiply(
+          scaled_divu[lev], m_mesh_map->detJ_cc(lev), 0, 0, 1,
+          a_divu[lev]->nGrow());
+        divu_for_proj[lev] = &scaled_divu[lev];
+      }
+    }
+  }
+
   if (macproj->needInitialization()) {
     amrex::LPInfo lpInfo;
     lpInfo.setMaxCoarseningLevel(m_mac_mg_max_coarsening_level);
@@ -261,7 +317,11 @@ PeleLM::macProject(
   macproj->getLinOp().setMaxOrder(m_mac_max_order);
   macproj->setUMAC(GetVecOfArrOfPtrs(advData->umac));
   if (has_divu != 0) {
-    macproj->setDivU(GetVecOfConstPtrs(a_divu));
+    if (m_mesh_mapping) {
+      macproj->setDivU(divu_for_proj);
+    } else {
+      macproj->setDivU(GetVecOfConstPtrs(a_divu));
+    }
   }
 
 #ifdef AMREX_USE_EB
@@ -321,6 +381,10 @@ PeleLM::macProject(
       a_divu[lev]->plus(Sbar, 0, 1);
     }
   }
+
+  // Intentionally no post-project umac / a_divu unscaling.  umac remains
+  // in uniform (Xi) space -- downstream advection consumers must apply
+  // their own mesh-mapping adjustments.
 
   // FillBoundary umac
   // Do coarse first

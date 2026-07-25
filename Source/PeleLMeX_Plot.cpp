@@ -1,5 +1,7 @@
 #include <PeleLMeX.H>
 #include <AMReX_PlotFileUtil.H>
+#include <AMReX_VisMF.H>
+#include <AMReX_AsyncOut.H>
 #include <AMReX_buildInfo.H>
 #include "PelePhysics.H"
 #include <PltFileManager.H>
@@ -7,6 +9,7 @@
 #include <PeleLMeX_BCfill.H>
 #include <AMReX_FillPatchUtil.H>
 #include <memory>
+#include <fstream>
 #ifdef AMREX_USE_EB
 #include <AMReX_EBInterpolater.H>
 #endif
@@ -34,6 +37,149 @@ GotoNextLine(std::istream& is)
   constexpr std::streamsize bl_ignore_max{100000};
   is.ignore(bl_ignore_max, '\n');
 }
+
+namespace {
+
+// Write the AMReX "standard" plotfile Header, then append the trailer
+// the AMReX ParaView/VisIt reader recognises: one extra vector field of
+// AMREX_SPACEDIM components holding the per-node displacement from Xi-
+// space to physical space.  Mirrors ERF's WriteGenericPlotfileHeader-
+// WithTerrain (Source/IO/ERF_Plotfile.cpp) but built on top of AMReX's
+// public WriteGenericPlotfileHeader so we don't duplicate the standard
+// header body.
+void
+writePlotfileHeaderWithMapping(
+  std::ostream& HeaderFile,
+  int nlevels,
+  const amrex::Vector<amrex::BoxArray>& bArrays,
+  const amrex::Vector<std::string>& varnames,
+  const amrex::Vector<amrex::Geometry>& geom,
+  amrex::Real time,
+  const amrex::Vector<int>& level_steps,
+  const amrex::Vector<amrex::IntVect>& ref_ratio,
+  const std::string& versionName,
+  const std::string& levelPrefix,
+  const std::string& mfPrefix,
+  const std::string& mfNodalPrefix)
+{
+  amrex::WriteGenericPlotfileHeader(
+    HeaderFile, nlevels, bArrays, varnames, geom, time, level_steps, ref_ratio,
+    versionName, levelPrefix, mfPrefix);
+
+  // Magic trailer: one extra vector field of AMREX_SPACEDIM components
+  // named nu_{x,y,z}.  The AMReX ParaView/VisIt plugin treats
+  // this as a node-centred displacement and renders the solution on
+  // (Xi + nu) rather than on Xi, yielding physical-space visualization
+  // automatically.
+  HeaderFile << 1 << '\n';
+  HeaderFile << AMREX_SPACEDIM << '\n';
+  HeaderFile << "nu_x" << '\n';
+#if (AMREX_SPACEDIM >= 2)
+  HeaderFile << "nu_y" << '\n';
+#endif
+#if (AMREX_SPACEDIM == 3)
+  HeaderFile << "nu_z" << '\n';
+#endif
+  for (int lev = 0; lev < nlevels; ++lev) {
+    HeaderFile << amrex::MultiFabHeaderPath(lev, levelPrefix, mfNodalPrefix)
+               << '\n';
+  }
+}
+
+// Write a multi-level plotfile in the AMReX native format, extended with
+// a per-level nodal-displacement MultiFab that tags the plotfile as
+// mesh-mapped.  The cell-centered data is written under MultiFab prefix
+// "Cell" and the nodal displacement under "Nu_nd"; the extra handshake
+// lines (see writePlotfileHeaderWithMapping) go at the end of Header.
+void
+writePlotfileWithMapping(
+  const std::string& plotfilename,
+  int nlevels,
+  const amrex::Vector<const amrex::MultiFab*>& mf_cc,
+  const amrex::Vector<const amrex::MultiFab*>& mf_nd,
+  const amrex::Vector<std::string>& varnames,
+  const amrex::Vector<amrex::Geometry>& geom,
+  amrex::Real time,
+  const amrex::Vector<int>& level_steps,
+  const amrex::Vector<amrex::IntVect>& ref_ratio,
+  const std::string& versionName = "HyperCLaw-V1.1")
+{
+  BL_PROFILE("PeleLMeX::writePlotfileWithMapping()");
+
+  AMREX_ALWAYS_ASSERT(nlevels <= mf_cc.size());
+  AMREX_ALWAYS_ASSERT(nlevels <= mf_nd.size());
+  AMREX_ALWAYS_ASSERT(nlevels <= ref_ratio.size() + 1);
+  AMREX_ALWAYS_ASSERT(nlevels <= level_steps.size());
+  AMREX_ALWAYS_ASSERT(mf_cc[0]->nComp() == static_cast<int>(varnames.size()));
+  AMREX_ALWAYS_ASSERT(mf_nd[0]->nComp() >= AMREX_SPACEDIM);
+
+  const std::string levelPrefix{"Level_"};
+  const std::string mfPrefix{"Cell"};
+  const std::string mfNodalPrefix{"Nu_nd"};
+
+  const bool callBarrier = false;
+  amrex::PreBuildDirectorHierarchy(
+    plotfilename, levelPrefix, nlevels, callBarrier);
+  amrex::ParallelDescriptor::Barrier();
+
+  // Header is written by the highest-rank process, matching ERF / AMReX
+  // convention.
+  if (
+    amrex::ParallelDescriptor::MyProc() ==
+    amrex::ParallelDescriptor::NProcs() - 1) {
+    amrex::Vector<amrex::BoxArray> bArrays(nlevels);
+    for (int lev = 0; lev < nlevels; ++lev) {
+      bArrays[lev] = mf_cc[lev]->boxArray();
+    }
+    auto f = [=]() {
+      amrex::VisMF::IO_Buffer io_buffer(amrex::VisMF::IO_Buffer_Size);
+      const std::string HeaderFileName(plotfilename + "/Header");
+      std::ofstream HeaderFile;
+      HeaderFile.rdbuf()->pubsetbuf(io_buffer.dataPtr(), io_buffer.size());
+      HeaderFile.open(
+        HeaderFileName.c_str(),
+        std::ofstream::out | std::ofstream::trunc | std::ofstream::binary);
+      if (!HeaderFile.good()) {
+        amrex::FileOpenFailed(HeaderFileName);
+      }
+      writePlotfileHeaderWithMapping(
+        HeaderFile, nlevels, bArrays, varnames, geom, time, level_steps,
+        ref_ratio, versionName, levelPrefix, mfPrefix, mfNodalPrefix);
+    };
+    if (amrex::AsyncOut::UseAsyncOut()) {
+      amrex::AsyncOut::Submit(std::move(f));
+    } else {
+      f();
+    }
+  }
+
+  for (int lev = 0; lev < nlevels; ++lev) {
+    if (amrex::AsyncOut::UseAsyncOut()) {
+      amrex::VisMF::AsyncWrite(
+        *mf_cc[lev],
+        amrex::MultiFabFileFullPrefix(lev, plotfilename, levelPrefix, mfPrefix),
+        true);
+      amrex::VisMF::AsyncWrite(
+        *mf_nd[lev],
+        amrex::MultiFabFileFullPrefix(
+          lev, plotfilename, levelPrefix, mfNodalPrefix),
+        true);
+    } else {
+      amrex::VisMF::Write(
+        *mf_cc[lev], amrex::MultiFabFileFullPrefix(
+                       lev, plotfilename, levelPrefix, mfPrefix));
+      amrex::VisMF::Write(
+        *mf_nd[lev], amrex::MultiFabFileFullPrefix(
+                       lev, plotfilename, levelPrefix, mfNodalPrefix));
+    }
+  }
+
+  if (amrex::AsyncOut::UseAsyncOut()) {
+    amrex::AsyncOut::Finalize();
+  }
+}
+
+} // anonymous namespace
 
 void
 PeleLM::WriteDebugPlotFile(
@@ -498,15 +644,61 @@ PeleLM::WritePlotFile()
 
 #ifdef AMREX_USE_HDF5
   if (m_write_hdf5_pltfile) {
+    // HDF5 plotfiles have no equivalent of the native plotfile's
+    // amrexvec_nu_* curvilinear-grid handshake.  When mesh mapping is
+    // active we still write the HDF5 file (so data archiving and
+    // parallel-I/O performance aren't lost), but it will render in
+    // Xi-space in ParaView/VisIt.  Warn once per run so the user is
+    // not surprised, and point at the native-plotfile path for
+    // physical-space visualization.
+    static bool hdf5_mesh_mapping_warned = false;
+    if (
+      m_mesh_mapping && (m_plot_mesh_mapping != 0) &&
+      !hdf5_mesh_mapping_warned) {
+      amrex::Print()
+        << "\n  [PeleLMeX] NOTE: HDF5 plotfile output is active together "
+           "with mesh mapping.\n"
+        << "    The AMReX HDF5 reader does not implement the "
+           "amrexvec_nu_* curvilinear\n"
+        << "    handshake used by the native plotfile reader, so HDF5 "
+           "plotfiles will\n"
+        << "    render in Xi-space (not physical space) in "
+           "ParaView/VisIt.  Options:\n"
+        << "      (a) switch to native plotfiles "
+           "(peleLM.use_hdf5_plt = 0) if you\n"
+        << "          need curvilinear visualization;\n"
+        << "      (b) set peleLM.plot_mesh_mapping = 0 to silence this "
+           "message and keep\n"
+        << "          HDF5 output in Xi-space.\n\n";
+      hdf5_mesh_mapping_warned = true;
+    }
     amrex::WriteMultiLevelPlotfileHDF5(
       plotfilename, finest_level + 1, GetVecOfConstPtrs(mf_plt), plt_VarsName,
       Geom(), m_cur_time, istep, refRatio());
   } else
 #endif
   {
-    amrex::WriteMultiLevelPlotfile(
-      plotfilename, finest_level + 1, GetVecOfConstPtrs(mf_plt), plt_VarsName,
-      Geom(), m_cur_time, istep, refRatio());
+    if (m_mesh_mapping && (m_plot_mesh_mapping != 0)) {
+      // Build per-level nodal-displacement MultiFabs (Xi -> physical)
+      // and emit the plotfile with the ERF-style "amrexvec_nu_*"
+      // handshake so ParaView/VisIt render on the curvilinear grid.
+      const int ncomp_nd = AMREX_SPACEDIM;
+      amrex::Vector<amrex::MultiFab> mf_nd(finest_level + 1);
+      for (int lev = 0; lev <= finest_level; ++lev) {
+        amrex::BoxArray nba(grids[lev]);
+        nba.surroundingNodes();
+        mf_nd[lev].define(nba, dmap[lev], ncomp_nd, 0);
+        m_mesh_map->fill_nodal_displacement(lev, Geom(lev), mf_nd[lev]);
+      }
+      writePlotfileWithMapping(
+        plotfilename, finest_level + 1, GetVecOfConstPtrs(mf_plt),
+        GetVecOfConstPtrs(mf_nd), plt_VarsName, Geom(), m_cur_time, istep,
+        refRatio());
+    } else {
+      amrex::WriteMultiLevelPlotfile(
+        plotfilename, finest_level + 1, GetVecOfConstPtrs(mf_plt), plt_VarsName,
+        Geom(), m_cur_time, istep, refRatio());
+    }
   }
 
 #ifdef PELE_USE_SPRAY
@@ -580,6 +772,31 @@ PeleLM::WriteHeader(const std::string& name, const bool is_checkpoint) const
     for (amrex::Real typical_value : typical_values) {
       HeaderFile << typical_value << "\n";
     }
+
+    // Optional recycling-plane block. When inlet-from-plane is enabled and
+    // recycling_active, emit the recycling block, including per-level status.
+    // "RecyclingPlanePresent: 0" means the feature was enabled but no recycling
+    // samples were available for that level yet; older checkpoints without
+    // the marker remain readable because the restart code treats the absence
+    // of the marker as "inactive".
+    const bool recycling_active =
+      (m_use_inlet_from_plane != 0) && m_inlet_recycling.initialized &&
+      static_cast<int>(m_inlet_recycling.mean_src.size()) >= finest_level + 1;
+    if ((m_use_inlet_from_plane != 0) && recycling_active) {
+      HeaderFile << "RecyclingPlane: " << "\n";
+      HeaderFile << (recycling_active ? m_inlet_recycling.n_samples : 0)
+                 << "\n";
+      for (int lev = 0; lev <= finest_level; ++lev) {
+        const bool planePresent =
+          recycling_active && (m_inlet_recycling.mean_src[lev] != nullptr);
+        HeaderFile << "RecyclingPlanePresent: " << (planePresent ? 1 : 0)
+                   << "\n";
+        if (planePresent) {
+          m_inlet_recycling.mean_src[lev]->boxArray().writeOn(HeaderFile);
+          HeaderFile << "\n";
+        }
+      }
+    }
   }
 }
 
@@ -649,6 +866,17 @@ PeleLM::WriteCheckPointFile()
           amrex::MultiFabFileFullPrefix(
             lev, checkpointname, level_prefix, "I_R"));
       }
+    }
+
+    // Per-level recycling-plane running mean (only when active and seeded).
+    if (
+      (m_use_inlet_from_plane != 0) && m_inlet_recycling.initialized &&
+      lev < static_cast<int>(m_inlet_recycling.mean_src.size()) &&
+      m_inlet_recycling.mean_src[lev]) {
+      amrex::VisMF::Write(
+        *m_inlet_recycling.mean_src[lev],
+        amrex::MultiFabFileFullPrefix(
+          lev, checkpointname, level_prefix, "recycle_mean"));
     }
   }
 #ifdef PELE_USE_SPRAY
@@ -787,6 +1015,39 @@ PeleLM::ReadCheckPointFile()
     GotoNextLine(is);
   }
 
+  // Optional recycling-plane block. Pre-existing checkpoints don't have this
+  // marker; we leave the state un-restored (the running mean will reseed
+  // from the next sample), however we must be careful to safely rewind the
+  // stream if the marker is not found
+  bool have_recycling_chk = false;
+  int chk_recycling_n_samples = 0;
+  amrex::Vector<amrex::BoxArray> chk_recycling_ba;
+  {
+    std::streampos pos = is.tellg();
+    std::string marker;
+    if ((is >> marker) && marker == "RecyclingPlane:") {
+      GotoNextLine(is);
+      is >> chk_recycling_n_samples;
+      GotoNextLine(is);
+      chk_recycling_ba.resize(finest_level + 1);
+      for (int lev = 0; lev <= finest_level; ++lev) {
+        std::string level_marker;
+        int level_present;
+        is >> level_marker >> level_present;
+        GotoNextLine(is);
+        AMREX_ASSERT(level_marker == "RecyclingPlanePresent:");
+        if (level_present != 0) {
+          chk_recycling_ba[lev].readFrom(is);
+          GotoNextLine(is);
+        }
+      }
+      have_recycling_chk = true;
+    } else {
+      is.clear();    // Clear EOF flags if they were set
+      is.seekg(pos); // Only rewind if RecyclingPlane data NOT found
+    }
+  }
+
   /***************************************************************************
    * Load fluid data                                                         *
    ***************************************************************************/
@@ -871,6 +1132,55 @@ PeleLM::ReadCheckPointFile()
 #endif
     }
   }
+
+  // Restore the recycling-plane running mean if both the checkpoint had it
+  // and recycling is enabled in this run. We deliberately ParallelCopy from a
+  // temporary MultiFab (built with the on-disk BoxArray) into the rebuilt
+  // slab (which uses the current run's maxGridSize), so a maxGridSize change
+  // between the original run and the restart is handled transparently.
+  if (have_recycling_chk && (m_use_inlet_from_plane != 0)) {
+    buildRecyclingPlaneStorage();
+    for (int lev = 0; lev <= finest_level; ++lev) {
+      if (
+        lev < static_cast<int>(chk_recycling_ba.size()) &&
+        (!chk_recycling_ba[lev].empty()) &&
+        lev < static_cast<int>(m_inlet_recycling.mean_src.size()) &&
+        m_inlet_recycling.mean_src[lev]) {
+        amrex::DistributionMapping chk_dm{
+          chk_recycling_ba[lev], amrex::ParallelDescriptor::NProcs()};
+        amrex::MultiFab chk_mean(
+          chk_recycling_ba[lev], chk_dm, AMREX_SPACEDIM, 0);
+        amrex::VisMF::Read(
+          chk_mean, amrex::MultiFabFileFullPrefix(
+                      lev, m_restart_chkfile, level_prefix, "recycle_mean"));
+        m_inlet_recycling.mean_src[lev]->ParallelCopy(
+          chk_mean, 0, 0, AMREX_SPACEDIM);
+      }
+    }
+    m_inlet_recycling.initialized = true;
+    m_inlet_recycling.n_samples = chk_recycling_n_samples;
+    if (m_inlet_recycling.n_samples <= m_inlet_plane_warmup_steps) {
+      amrex::Print()
+        << "WARNING: Current setting for inlet_plane_warmup_steps is greater "
+        << "than or equal to checkpointed n_samples. Injected fluctuations "
+        << "will remain disabled until additional snapshots increase "
+        << "n_samples beyond the warmup threshold.\n";
+    }
+    // Storage was just rebuilt from current-run geometry; the regrid hooks
+    // may set this back to 1 later, which is fine.
+    m_recycling_needs_rebuild = false;
+  } else if (have_recycling_chk && (m_use_inlet_from_plane == 0)) {
+    amrex::Print()
+      << "WARNING: Restart checkpoint contains RecyclingPlane data, but "
+      << "peleLM.use_inlet_from_plane = 0 in this run. Ignoring checkpointed "
+      << "recycling-plane running mean.\n";
+  } else if ((!have_recycling_chk) && (m_use_inlet_from_plane != 0)) {
+    amrex::Print()
+      << "WARNING: peleLM.use_inlet_from_plane != 0 in this run, but the "
+      << "restart checkpoint does not contain RecyclingPlane data. "
+      << "Recycling-plane running mean will not be restored from checkpoint.\n";
+  }
+
   if (m_verbose != 0) {
     amrex::Print() << "Restart complete \n";
   }

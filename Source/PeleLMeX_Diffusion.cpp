@@ -244,6 +244,41 @@ PeleLM::computeDifferentialDiffusionTerms(
     }
   }
 #endif
+
+  // Under mesh mapping the flux divergence was computed in Xi-space on
+  // Xi-space fluxes (bcoeff carries the J/fac^2 factor).  That produces
+  // J . (physical divergence).  Divide each divergence term by J so the
+  // returned Dn / Dnp1 / Dwbar / DT are in physical-space units.
+  if (m_mesh_mapping) {
+    for (int lev = 0; lev <= finest_level; ++lev) {
+      amrex::MultiFab& dterm =
+        (a_time == AmrOldTime) ? diffData->Dn[lev] : diffData->Dnp1[lev];
+      const int nc = dterm.nComp();
+      for (int n = 0; n < nc; ++n) {
+        amrex::MultiFab::Divide(dterm, m_mesh_map->detJ_cc(lev), 0, n, 1, 0);
+      }
+      if (m_nAux > 0) {
+        amrex::MultiFab& dt_aux = (a_time == AmrOldTime)
+                                    ? diffData->Dn_aux[lev]
+                                    : diffData->Dnp1_aux[lev];
+        for (int n = 0; n < dt_aux.nComp(); ++n) {
+          amrex::MultiFab::Divide(dt_aux, m_mesh_map->detJ_cc(lev), 0, n, 1, 0);
+        }
+      }
+      if ((is_init == 0) && (m_use_wbar != 0)) {
+        for (int n = 0; n < diffData->Dwbar[lev].nComp(); ++n) {
+          amrex::MultiFab::Divide(
+            diffData->Dwbar[lev], m_mesh_map->detJ_cc(lev), 0, n, 1, 0);
+        }
+      }
+      if ((is_init == 0) && (m_use_soret != 0)) {
+        for (int n = 0; n < diffData->DT[lev].nComp(); ++n) {
+          amrex::MultiFab::Divide(
+            diffData->DT[lev], m_mesh_map->detJ_cc(lev), 0, n, 1, 0);
+        }
+      }
+    }
+  }
 }
 
 template <typename EOSType>
@@ -1089,6 +1124,31 @@ PeleLM::differentialDiffusionUpdate(
 {
   BL_PROFILE("PeleLMeX::differentialDiffusionUpdate()");
 
+  // Refill the AmrNewTime ghost cells of the scalars about to be
+  // diffused.  See PeleLM::diffuseVelocity for the analogous fix and
+  // the LidDrivenCavity regression for the discovery of this class
+  // of bug: the implicit Crank-Nicholson solve in diffuse_scalar
+  // pulls its Dirichlet boundary value from the ghost cells of its
+  // input MultiFab when no explicit a_boundary is supplied.  Scalar
+  // advection between the last fillPatchState (in oneSDC) and this
+  // routine writes new interior values without refreshing the
+  // ghosts, so the implicit solve would otherwise see stale (or, in
+  // pathological cases, zero) Dirichlet data at Inflow faces.  For
+  // typical Pele setups where Inflow scalars are static this would
+  // be benign, but it is wrong as soon as bcnormal becomes time-
+  // dependent and is hostile to anyone porting moving-wall- or
+  // moving-Dirichlet-style problems to PeleLMeX.  Refilling now keeps
+  // the implicit solve consistent with whatever bcnormal currently
+  // returns at AmrNewTime.
+  fillPatchSpecies(AmrNewTime);
+  if (m_nAux > 0) {
+    fillPatchAux(AmrNewTime);
+  }
+  // Temperature ghost cells are managed explicitly by the
+  // deltaTIter_prepare / deltaTIter_update pair below (which sets T
+  // and its ghost to zero before each deltaT solve and refills via
+  // fillPatchTemp after).  No refill needed here.
+
   //------------------------------------------------------------------------
   // Setup fluxes
   // [0:NUM_SPECIES-1] Species     : \Flux_k
@@ -1897,6 +1957,23 @@ PeleLM::diffuseVelocity()
   BL_PROFILE("PeleLMeX::diffuseVelocity()");
   // Get the density component BCRec to get viscosity on faces
   auto bcRec = fetchBCRecArray(DENSITY, 1);
+
+  // BUGFIX: the implicit Crank-Nicholson solve below calls setLevelBC
+  // on the velocity MultiFab and pulls the Dirichlet boundary value
+  // from its ghost cells.  After updateVelocity (the explicit
+  // predictor) the new-time velocity ghost cells contain whatever
+  // was there from the previous fillpatch, NOT the bcnormal value at
+  // Inflow faces -- in particular they are zero for a moving-wall
+  // tangential component that has not been refilled since.  Without
+  // this refill the implicit corrector enforces u_face = 0 at the
+  // Inflow boundary instead of the user-supplied value, so the only
+  // wall-stress contribution comes from the explicit 0.5*divTau^n
+  // half of the C-N split.  See the LidDrivenCavity regression test
+  // for the test case that surfaces this.
+  for (int lev = 0; lev <= finestLevel(); ++lev) {
+    auto& vel_mf = getLevelDataPtr(lev, AmrNewTime)->state;
+    setInflowBoundaryVel(vel_mf, lev, AmrNewTime);
+  }
 
   // CrankNicholson 0.5 coeff
   const amrex::Real dt_lcl = 0.5 * m_dt;

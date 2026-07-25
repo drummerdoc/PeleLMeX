@@ -46,12 +46,26 @@ PeleLM::Setup()
 
   m_wall_start = amrex::ParallelDescriptor::second();
 
-  // Ensure grid is isotropic
+  // Ensure grid is isotropic.
+  //
+  // When mesh mapping is enabled, the AMReX grid represents the uniform
+  // (Xi) computational grid and *must* be anisotropic in order for the
+  // physical grid (dx_AMReX . fac_i per direction) to be isotropic.
+  // We therefore skip this assertion when geometry.mesh_mapping is set
+  // in the inputs; the mapping model is expected to produce a
+  // physically isotropic grid (or the user has intentionally chosen
+  // anisotropic physical spacing).
   {
-    auto const dx = geom[0].CellSizeArray();
-    AMREX_ALWAYS_ASSERT(AMREX_D_TERM(
-      , amrex::almostEqual(dx[0], dx[1], 10),
-      &&amrex::almostEqual(dx[1], dx[2], 10)));
+    std::string mesh_mapping_name;
+    amrex::ParmParse ppg("geometry");
+    const bool mesh_mapping_on =
+      static_cast<bool>(ppg.query("mesh_mapping", mesh_mapping_name));
+    if (!mesh_mapping_on) {
+      auto const dx = geom[0].CellSizeArray();
+      AMREX_ALWAYS_ASSERT(AMREX_D_TERM(
+        , amrex::almostEqual(dx[0], dx[1], 10),
+        &&amrex::almostEqual(dx[1], dx[2], 10)));
+    }
   }
   // Print build info to screen
 #ifdef PELE_USE_CMAKE
@@ -178,6 +192,16 @@ PeleLM::Setup()
   // Derived variables
   derivedSetup();
 
+  // Emit mesh-mapping displacement metadata alongside the plotfile
+  // when mesh mapping is active (so ParaView/VisIt renders in physical
+  // space).  On by default; set to 0 to keep Xi-space plotfiles.
+  // Parsed unconditionally so the query also runs for incompressible /
+  // chemistry-off cases.
+  {
+    amrex::ParmParse ppplt("peleLM");
+    ppplt.query("plot_mesh_mapping", m_plot_mesh_mapping);
+  }
+
   // Evaluate variables
   evaluateSetup();
 
@@ -256,6 +280,46 @@ PeleLM::readParameters()
   pp.query("mlmg_fail_plt_residuals", m_mlmg_fail_plt_residuals);
 
   // -----------------------------------------
+  // Mesh mapping (optional)
+  // -----------------------------------------
+  // Activate via e.g.  geometry.mesh_mapping
+  {
+    amrex::ParmParse ppg("geometry");
+    std::string mesh_mapping_name;
+    if (ppg.query("mesh_mapping", mesh_mapping_name) != 0) {
+
+      // --- Compatibility guards -----------------------------------------
+      // These match amr-wind PR #545's stated limitations.  Relaxing any
+      // of these requires additional implementation work (see notes).
+#ifdef AMREX_USE_EB
+      amrex::Abort(
+        "mesh_mapping is not supported with Embedded Boundaries (EB).\n"
+        "Rebuild without USE_EB or omit geometry.mesh_mapping.");
+#endif
+#ifdef PELE_USE_PLASMA
+      amrex::Abort(
+        "mesh_mapping is not supported with the plasma solver "
+        "(PELE_USE_PLASMA).");
+#endif
+      if (geom[0].IsRZ()) {
+        amrex::Abort(
+          "mesh_mapping is not supported with RZ geometry "
+          "(geometry.coord_sys = 1).");
+      }
+      if (max_level > 0) {
+        amrex::Print()
+          << " WARNING: mesh_mapping has only been exercised on "
+             "single-level AMR;\n          multi-level behaviour with "
+             "max_level > 0 is not verified.\n";
+      }
+
+      m_mesh_map = MeshMap::create(mesh_mapping_name);
+      m_mesh_mapping = true;
+      amrex::Print() << " Mesh mapping enabled: " << mesh_mapping_name << "\n";
+    }
+  }
+
+  // -----------------------------------------
   // Boundary conditions
   // -----------------------------------------
   int isOpenDomain = 0;
@@ -280,6 +344,31 @@ PeleLM::readParameters()
   if ((verbose != 0) && (m_closed_chamber != 0)) {
     amrex::Print()
       << " Simulation performed with the closed chamber algorithm \n";
+  }
+
+  // -----------------------------------------
+  // Recycling-plane inflow
+  // -----------------------------------------
+  pp.query("use_inlet_from_plane", m_use_inlet_from_plane);
+  pp.query("inlet_plane_dir", m_inlet_plane_dir);
+  pp.query("inlet_plane_position", m_inlet_plane_position);
+  pp.query("inlet_plane_avg_window", m_inlet_plane_avg_window);
+  pp.query("inlet_plane_warmup_steps", m_inlet_plane_warmup_steps);
+  if (m_use_inlet_from_plane != 0) {
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      m_inlet_plane_dir >= 0 && m_inlet_plane_dir < AMREX_SPACEDIM,
+      "peleLM.inlet_plane_dir must be set to a valid direction "
+      "when peleLM.use_inlet_from_plane is enabled");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      m_inlet_plane_position >= geom[0].ProbLo()[m_inlet_plane_dir] &&
+        m_inlet_plane_position <= geom[0].ProbHi()[m_inlet_plane_dir],
+      "peleLM.inlet_plane_position must lie within the problem domain "
+      "bounds in peleLM.inlet_plane_dir when "
+      "peleLM.use_inlet_from_plane is enabled");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      m_inlet_plane_warmup_steps >= 0,
+      "peleLM.inlet_plane_warmup_steps must be non-negative when "
+      "peleLM.use_inlet_from_plane is enabled");
   }
 
 #ifdef PELE_USE_PLASMA
@@ -1655,4 +1744,9 @@ PeleLM::resizeArray()
   // Load balancing
   m_costs.resize(max_level + 1);
   m_loadBalanceEff.resize(max_level + 1);
+
+  // Mesh mapping metric fields (if enabled; otherwise no-op)
+  if (m_mesh_map) {
+    m_mesh_map->resize(max_level + 1);
+  }
 }
