@@ -119,6 +119,9 @@ Current Roster
 - Thierry Pionsot
 - Andrew Aspden
 - Andrea Gruber
+- Jackie Chen
+- Haiou Wang (Zheijang)
+- Aditya Konduri
 
 
 See: `GitHub team <https://github.com/orgs/AMReX-Combustion/teams/pele-advisory-panel>`__
