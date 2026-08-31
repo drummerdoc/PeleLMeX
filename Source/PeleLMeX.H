@@ -364,6 +364,18 @@ public:
   void checkRunParams();
   void checkSetupParams();
 
+  /**
+   * \brief Check that the mesh aspect ratio is compatible with the active
+   * modules.
+   *
+   * Anisotropic uniform meshes are supported by the core algorithm. Embedded
+   * boundaries (compile time) and spray (compile time and runtime) are not:
+   * both use dx[0] as *the* cell size. Must be called after readParameters(),
+   * when mesh mapping and do_spray_particles are known, and before
+   * makeEBGeometry().
+   */
+  void checkMeshIsotropy();
+
   //-----------------------------------------------------------------------------
   // REGRID / LOAD BALANCE
 

@@ -88,10 +88,15 @@ PeleLM::estEFIonsDt(const TimeStamp a_time)
       });
     amrex::Gpu::streamSynchronize();
     const auto dx = Geom(lev).CellSizeArray();
+    // Smallest cell dimension: identical to dx[0] on an isotropic mesh, and
+    // conservative (rather than simply wrong) on an anisotropic one. Plasma
+    // is therefore not part of the isotropy guard in checkMeshIsotropy().
+    const amrex::Real dxmin =
+      amrex::min<amrex::Real>(AMREX_D_DECL(dx[0], dx[1], dx[2]));
     const amrex::Real cfl_lcl = m_cfl;
     estdt_lev = amrex::ReduceMin(
       driftVelMax_cc, 0,
-      [dx, cfl_lcl] AMREX_GPU_HOST_DEVICE(
+      [dxmin, cfl_lcl] AMREX_GPU_HOST_DEVICE(
         amrex::Box const& bx,
         amrex::Array4<amrex::Real const> const& ueffm) noexcept -> amrex::Real {
         const auto lo = amrex::lbound(bx);
@@ -109,7 +114,7 @@ PeleLM::estEFIonsDt(const TimeStamp a_time)
             }
           }
         }
-        return dx[0] / velmax * cfl_lcl;
+        return dxmin / velmax * cfl_lcl;
       });
 
     // Min across levels

@@ -196,6 +196,11 @@ PeleLM::SpraySetState(const amrex::Real& a_flow_dt)
     // Extract velocity and CFL from a given spray CFL
     amrex::Real cur_spray_cfl = SprayParticleContainer::spray_cfl;
     amrex::Real spraydt_lev = SprayPC->estTimestep(lev);
+    // dx[0] stands in for "the" cell size in the spray CFL (here and in the
+    // PelePhysics spray library). That is valid only because runs with spray
+    // active are required to have an isotropic mesh -- see checkMeshIsotropy()
+    // in PeleLMeX_Setup.cpp. Relaxing that guard means fixing these
+    // expressions, not just the guard.
     amrex::Real vel_lev = cur_spray_cfl * dx[0] / spraydt_lev;
     max_vel = amrex::max<amrex::Real>(max_vel, vel_lev);
     if (spraydt_lev > 0.) {

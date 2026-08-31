@@ -46,27 +46,10 @@ PeleLM::Setup()
 
   m_wall_start = amrex::ParallelDescriptor::second();
 
-  // Ensure grid is isotropic.
-  //
-  // When mesh mapping is enabled, the AMReX grid represents the uniform
-  // (Xi) computational grid and *must* be anisotropic in order for the
-  // physical grid (dx_AMReX . fac_i per direction) to be isotropic.
-  // We therefore skip this assertion when geometry.mesh_mapping is set
-  // in the inputs; the mapping model is expected to produce a
-  // physically isotropic grid (or the user has intentionally chosen
-  // anisotropic physical spacing).
-  {
-    std::string mesh_mapping_name;
-    amrex::ParmParse ppg("geometry");
-    const bool mesh_mapping_on =
-      static_cast<bool>(ppg.query("mesh_mapping", mesh_mapping_name));
-    if (!mesh_mapping_on) {
-      auto const dx = geom[0].CellSizeArray();
-      AMREX_ALWAYS_ASSERT(AMREX_D_TERM(
-        , amrex::almostEqual(dx[0], dx[1], 10),
-        &&amrex::almostEqual(dx[1], dx[2], 10)));
-    }
-  }
+  // NOTE: the mesh isotropy check used to live here, as an unconditional
+  // assert on geom[0]. It is now checkMeshIsotropy(), called just after
+  // readParameters() below: the requirement is owned by EB and spray, and
+  // whether spray is active is only known once the inputs have been read.
   // Print build info to screen
 #ifdef PELE_USE_CMAKE
   const std::string pele_hash = PeleBuildInfo::PeleLMeX_git_hash;
@@ -96,6 +79,12 @@ PeleLM::Setup()
 
   // Read PeleLMeX parameters
   readParameters();
+
+  // Mesh isotropy. Must come after readParameters(), which is what sets
+  // m_mesh_mapping and reads peleLM.do_spray_particles; and before
+  // makeEBGeometry(), so an unsupported mesh is reported rather than handed
+  // to the EB machinery.
+  checkMeshIsotropy();
 
 #ifdef AMREX_USE_EB
   makeEBGeometry();
@@ -991,6 +980,144 @@ PeleLM::readParameters()
   pp.query("user_defined_ext_sources", m_user_defined_ext_sources);
   pp.query("plot_extSource", m_plot_extSource);
   pp.query("add_variance_sources", m_add_variance_sources);
+}
+
+void
+PeleLM::checkMeshIsotropy()
+{
+  BL_PROFILE("PeleLMeX::checkMeshIsotropy()");
+
+  auto const dx = geom[0].CellSizeArray();
+#if (AMREX_SPACEDIM == 3)
+  const bool isotropic = amrex::almostEqual(dx[0], dx[1], 10) &&
+                         amrex::almostEqual(dx[1], dx[2], 10);
+#elif (AMREX_SPACEDIM == 2)
+  const bool isotropic = amrex::almostEqual(dx[0], dx[1], 10);
+#else
+  const bool isotropic = true;
+#endif
+
+  // ---------------------------------------------------------------------
+  // Mesh mapping: the AMReX grid is the uniform computational (Xi) grid and
+  // *must* be allowed to be anisotropic so that the physical grid
+  // (dx_Xi * fac_i per direction) can be isotropic. The mapping model owns
+  // physical spacing, so the Xi-grid isotropy check does not apply.
+  // Mapping is already made mutually exclusive with EB, plasma and RZ in
+  // readParameters(); spray is the remaining incompatibility.
+  // ---------------------------------------------------------------------
+  if (m_mesh_mapping) {
+#ifdef PELE_USE_SPRAY
+    if (do_spray_particles) {
+      amrex::Abort(
+        "geometry.mesh_mapping is not supported with active spray: the spray "
+        "kernels would treat the computational (Xi) cell size as a physical "
+        "length.\n"
+        "Set peleLM.do_spray_particles = 0 or omit geometry.mesh_mapping.");
+    }
+#endif
+    return;
+  }
+
+  // ---------------------------------------------------------------------
+  // Who actually requires dx == dy == dz ?
+  //
+  //  - EB. The AMReX EB data structures and the AMReX-Hydro EB advection /
+  //    redistribution machinery assume isotropic cells, and the LMeX EB
+  //    helpers use dx[0] as a length proxy (extendSignedDistance,
+  //    PeleLMeX_Utils.cpp). Compile-time gate: those paths are live in any
+  //    AMREX_USE_EB build, 'all_regular' included.
+  //  - Spray. The PelePhysics spray library bakes dx[0] in as *the* cell
+  //    size (droplet CFL, face areas), as does the LMeX-side spray CFL in
+  //    PeleLMeX_SprayParticles.cpp. Those expressions are wrong, not merely
+  //    conservative, on anisotropic cells. Gated at runtime as well, on
+  //    peleLM.do_spray_particles.
+  //
+  // The rest of the algorithm is per-direction clean: dt estimates loop over
+  // idim with the per-direction dx, the MAC (MLABecLaplacian) and nodal
+  // projections and the diffusion solves handle anisotropic dx natively,
+  // Godunov advection in AMReX-Hydro is per-direction, and the temporals /
+  // area factors use the correct per-direction products. The LES filter
+  // width is cbrt(cell volume), which is well defined on anisotropic cells
+  // (its physical interpretation is then the user's responsibility).
+  // ---------------------------------------------------------------------
+  bool requires_isotropic = false;
+  std::string isotropy_owner;
+#ifdef AMREX_USE_EB
+  requires_isotropic = true;
+  isotropy_owner = "the build has embedded boundaries enabled (AMREX_USE_EB)";
+#endif
+#ifdef PELE_USE_SPRAY
+  if (do_spray_particles) {
+    isotropy_owner =
+      requires_isotropic
+        ? isotropy_owner + ", and spray is active (peleLM.do_spray_particles)"
+        : "spray is active (peleLM.do_spray_particles)";
+    requires_isotropic = true;
+  }
+#endif
+
+  // With a scalar amr.ref_ratio, checking level 0 covers every level. With a
+  // direction-dependent ref_ratio the cell aspect ratio drifts from level to
+  // level, so an isotropic level 0 says nothing about the finer ones.
+  bool uniform_ref_ratio = true;
+  for (int lev = 0; lev < max_level; ++lev) {
+    const auto& rr = refRatio(lev);
+    for (int idim = 1; idim < AMREX_SPACEDIM; ++idim) {
+      if (rr[idim] != rr[0]) {
+        uniform_ref_ratio = false;
+      }
+    }
+  }
+
+  std::string dxstr = "dx = " + std::to_string(dx[0]);
+#if (AMREX_SPACEDIM >= 2)
+  dxstr += ", dy = " + std::to_string(dx[1]);
+#endif
+#if (AMREX_SPACEDIM == 3)
+  dxstr += ", dz = " + std::to_string(dx[2]);
+#endif
+
+  if (requires_isotropic) {
+    if (!isotropic) {
+      amrex::Abort(
+        "This configuration requires an isotropic mesh, but the level 0 cells "
+        "are anisotropic.\n"
+        "  Level 0: " +
+        dxstr +
+        "\n"
+        "  Isotropy is required because " +
+        isotropy_owner +
+        ".\n"
+        "  Remedies: make the grid isotropic (adjust amr.n_cell and/or "
+        "geometry.prob_lo/prob_hi),\n"
+        "            rebuild without EB, or set peleLM.do_spray_particles = "
+        "0.");
+    }
+    if (!uniform_ref_ratio) {
+      amrex::Abort(
+        "This configuration requires an isotropic mesh, but amr.ref_ratio "
+        "differs by direction,\n"
+        "so the cell aspect ratio changes from level to level. Isotropy is "
+        "required because " +
+        isotropy_owner +
+        ".\n"
+        "Use a single (direction-independent) refinement ratio.");
+    }
+  } else {
+    if (!uniform_ref_ratio) {
+      amrex::Print()
+        << " WARNING: amr.ref_ratio differs by direction; the cell aspect "
+           "ratio\n"
+           "          changes from level to level. This is permitted here (no "
+           "EB,\n"
+           "          no active spray) but is not covered by the anisotropic "
+           "mesh audit.\n";
+    }
+    if (!isotropic) {
+      amrex::Print() << " Anisotropic uniform mesh in use (" << dxstr
+                     << "); permitted: no EB, no active spray.\n";
+    }
+  }
 }
 
 void

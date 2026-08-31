@@ -67,6 +67,55 @@ Grid/AMR parameters
 
     peleLM.max_grid_size_chem = 32         # [OPT, DEF="None"] Max box size for the Chemistry BoxArray
 
+.. _ssec:cellAspectRatio:
+
+Cell aspect ratio
+^^^^^^^^^^^^^^^^^
+
+PeleLMeX supports anisotropic uniform meshes, i.e. a grid where the cell size
+differs by direction (``dx != dy != dz``) but is uniform within each direction.
+The core algorithm is per-direction throughout: the time step estimates, the
+MAC and nodal projections, the diffusion solves, the Godunov advection and the
+domain flux/area factors all use the per-direction cell size.
+
+Two modules do *not* support anisotropic cells, because they use ``dx[0]`` as
+*the* cell size rather than as one of three:
+
+* **Embedded boundaries.** The AMReX EB data structures and the AMReX-Hydro EB
+  advection/redistribution machinery assume isotropic cells, and PeleLMeX's own
+  EB helpers use ``dx[0]`` as a length proxy. This is a *compile-time*
+  requirement: it applies to any build with EB enabled, including runs with
+  ``eb2.geom_type = all_regular``.
+* **Spray.** The droplet CFL and the spray source face areas are built from
+  ``dx[0]``. This is a *runtime* requirement: it applies to spray-enabled
+  builds only when ``peleLM.do_spray_particles = 1`` (the default).
+
+Accordingly, at the end of setup PeleLMeX checks the level 0 cell size:
+
+* If EB is compiled in, or spray is compiled in and active, an anisotropic
+  mesh is a hard error. The message reports the three cell sizes, which module
+  requires isotropy, and the available remedies (make the grid isotropic,
+  rebuild without EB, or set ``peleLM.do_spray_particles = 0``).
+* Otherwise an anisotropic mesh is permitted, and a one-line notice recording
+  the cell sizes is written to the log.
+
+A direction-dependent ``amr.ref_ratio`` (e.g. ``amr.ref_ratio = 2 1 2``) makes
+the cell aspect ratio change from level to level, so checking level 0 no longer
+covers the finer levels. It is rejected in EB and spray-enabled runs, and
+warned about otherwise.
+
+.. note::
+   On an anisotropic mesh the LES filter width is the cube root of the cell
+   volume, ``cbrt(dx*dy*dz)``. That is well defined, but whether it is the
+   appropriate filter width for a strongly stretched cell is the user's
+   judgement, not the code's.
+
+.. note::
+   These rules apply to the *physical* mesh. When ``geometry.mesh_mapping`` is
+   used, the AMReX grid is the uniform computational grid and is expected to be
+   anisotropic; the isotropy check is skipped and the mapping owns the physical
+   spacing. See :ref:`Mesh Mapping <ssec:meshMappingParameters>`.
+
 Load balancing
 --------------
 
@@ -337,6 +386,13 @@ Mesh Mapping
 .. note::
    Three mesh maps are provided with `PeleLMeX.  If `mesh_mapping` is not specified, no mapping will be applied. Each map has associated
    parameters shown above.
+
+.. note::
+   Mesh mapping is mutually exclusive with embedded boundaries, the plasma
+   solver, RZ geometry and active spray. With mapping enabled the AMReX grid is
+   the uniform computational (Xi) grid, so its cell sizes are not physical
+   lengths; spray kernels would use them as if they were. Set
+   ``peleLM.do_spray_particles = 0`` or drop ``geometry.mesh_mapping``.
    
 
 Turbulent Forcing and Velocity Plotfile

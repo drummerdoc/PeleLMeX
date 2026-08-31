@@ -2225,6 +2225,10 @@ PeleLM::extendSignedDistance(
   // First set the region far away at the max value we need
   auto const& sd_cc_ma = a_signDist->arrays();
   const auto& dx = geom[0].CellSizeArray();
+  // dx[0] stands in for "the" cell size here. That is valid only because EB
+  // builds are required to have an isotropic mesh -- see checkMeshIsotropy()
+  // in PeleLMeX_Setup.cpp. If that guard is ever relaxed for EB, this (and
+  // the seed distance in the loop below) must be revisited.
   const amrex::Real sd_cc_fact = nGrowFac * dx[0] * a_extendFactor;
   amrex::ParallelFor(
     *a_signDist, a_signDist->nGrowVect(),
