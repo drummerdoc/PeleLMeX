@@ -130,7 +130,8 @@ IO parameters
 
     amr.restart          = chk00100        # [OPT, DEF=""] Checkpoint from which to restart the simulation
     amr.initDataPlt      = plt01000        # [OPT, DEF=""] Provide a plotfile from which to extract initial data
-    peleLM.initDataPlt_reset_time = 1               # [OPT, DEF=1] Resets time and nsteps to 0 after restarting from a plot file. (Warning: plot file will be rewritten if not renamed and argument value = 0)
+    peleLM.initDataPlt_reset_time = 1      # [OPT, DEF=1] Resets time and nsteps to 0 after restarting from a plot file. (Warning: plot file will be rewritten if not renamed and argument value = 0)
+    peleLM.initDataPlt_coarsen = 0         # [OPT, DEF=0] Enable restarting from plotfile with 2x coarser base mesh (non-EB only). Uses multi-level mapping.
     peleLM.initDataPlt_specname_map = spec1 spec2 # [OPT, DEF=""] If specified, lookup these entries instead of species names when populating species from the init plot file (length must match NUM_SPECIES)
     peleLM.initDataPlt_patch_flow_variables = false # [OPT, DEF=false] Enable user-defined flow variable patching after reading a plot solution file
     amr.regrid_on_restart = 1              # [OPT, DEF="0"] Trigger a regrid after the data from checkpoint are loaded
@@ -380,16 +381,67 @@ the user through the standard ``Inflow`` boundary condition; this feature only
 supplies the bracketed fluctuation. The running mean is preserved in
 checkpoints and restored across restarts.
 
+Alternatively, ``peleLM.recycling_mode = full`` injects the entire sampled
+velocity, :math:`\mathbf{u}_{\text{inlet}}(t) = \gamma(t)\,
+\mathbf{u}_{\text{src}}(t)`, with no running mean maintained. The recycled
+velocity is enforced by the boundary-fill machinery itself: whatever
+``bcnormal`` writes to the velocity components on the recycling face is
+ignored in this mode, so existing problem setups (including ones that add a
+mean profile to the velocity) run unmodified; ``bcnormal`` still controls
+the thermodynamic state. Full mode carries no restart state (the injection
+buffer reseeds from the first snapshot after initialization or restart,
+taken before the first boundary fill), and the ``inlet_plane_avg_window`` /
+``inlet_plane_warmup_steps`` controls are ignored.
+
+The factor :math:`\gamma(t)` above is the full-mode **mass-flux control**
+(on by default). Because full mode feeds the sampled velocity straight back
+to the inlet, the bulk flow rate is a closed feedback loop that carries no
+memory of the intended inflow: it is only neutrally stable in an adiabatic
+constant-area duct, and any net heat transfer between the inlet and the
+source plane biases it. In the low-Mach setting, wall heat loss makes
+:math:`\nabla \cdot \mathbf{u} < 0` in the duct, so the plane always
+returns a smaller volume flux than the inlet received (mass flux, not
+volume flux, is what convection conserves) and the recycled bulk flow
+decays monotonically until the inlet reverses — cooled walls collapse
+within a few tens of flow-through times. The controller closes the loop:
+every snapshot, the sample's normal velocity component is rescaled by
+:math:`\gamma = Q_0 / Q_{\text{src}}`, where both the target :math:`Q_0`
+and the sampled :math:`Q_{\text{src}}` are EB-masked volumetric flow rates
+through the same cross-section. :math:`Q_0` is measured once from the
+``bcnormal`` inflow profile (or set explicitly via
+``peleLM.inlet_plane_target_flow_rate``). The rescaling is multiplicative
+and applied to all velocity components: the sampled fluctuation field is
+solenoidal to low-Mach accuracy, with continuity coupling the normal and
+tangential components mode by mode, so the uniform scaling preserves that
+structure and the injected turbulence passes through the inlet-adjacent
+projection intact (a normal-only scaling would leave an irrotational
+residual for the projection to remove, distorting the tangential
+fluctuations). No-slip walls, the sampled profile shape, and the sample's
+relative turbulence intensity are all preserved. :math:`\gamma` is clipped
+to :math:`[0.5, 2]` (with a warning), and the run aborts if the sampled
+through-flow collapses below 5% of the target or reverses, since a
+collapsed sample can no longer be rescaled into a meaningful inflow.
+
 ::
 
     #-----------------------Recycling-plane inflow-----------------------
     peleLM.use_inlet_from_plane     = 0       # [OPT, DEF=0] Master switch (0 disables)
     peleLM.inlet_plane_dir          = -1      # [REQ if active] Sampling axis: 0=x, 1=y, 2=z
     peleLM.inlet_plane_position     = 0.0     # [REQ if active] Physical coordinate of the source plane along inlet_plane_dir
+    peleLM.recycling_mode           = fluctuations # [OPT, DEF=fluctuations] 'fluctuations' injects u - <u> on top of the
+                                              #                 bcnormal profile; 'full' injects the sampled velocity itself
     peleLM.inlet_plane_avg_window   = -1.0    # [OPT, DEF=-1.0] Time-window (s) for the running mean (EMA);
                                               #                 <=0 falls back to a cumulative 1/N average.
+                                              #                 Fluctuations mode only.
     peleLM.inlet_plane_warmup_steps = 0       # [OPT, DEF=0] Number of samples to accumulate before any
-                                              #              fluctuation is injected (lets the running mean settle)
+                                              #              fluctuation is injected (lets the running mean settle).
+                                              #              Fluctuations mode only.
+    peleLM.inlet_plane_flux_control = 1       # [OPT, DEF=1] Full mode only: rescale the injected sample to the
+                                              #              target inlet flow rate every step. Disable (0) only for
+                                              #              adiabatic constant-area ducts, and at your own risk.
+    peleLM.inlet_plane_target_flow_rate = ""  # [OPT] Full mode only: target volumetric flow rate (m^3/s, EB-masked,
+                                              #       signed along +inlet_plane_dir). Default: measured from the
+                                              #       bcnormal inflow profile on first use.
 
 The source plane is one cell thick along ``inlet_plane_dir`` and spans the full
 transverse cross-section at ``inlet_plane_position``. Storage is allocated
@@ -703,9 +755,12 @@ to activate `temporal` diagnostics performing these reductions at given interval
 
 The `do_temporal` flag will trigger the creation of a `temporals` folder in your run directory and the following entries
 will be appended to an ASCII `temporals/tempState` file: step, time, dt, kin. energy integral, enstrophy integral, mean pressure
-, fuel consumption rate integral, heat release rate integral. Additionally, if the `do_temporal` flag is activated, one can
-turn on state extremas (stored in `temporals/tempExtremas` as min/max for each state entry), mass balance (stored in
-`temporals/tempMass`) computing the total mass, dMdt and advective mass fluxes across the domain boundaries as well as the error in
+, fuel consumption rate integral, heat release rate integral. Please note that for simulations using finite-rate chemistry, the 
+heat-release rate integral is computed from the species reaction rates and enthalpies (:math:`-\sum_n h_n \dot\omega_n`). For the 
+manifold EOS, it is instead obtained by integrating the tabulated `HRR` variable looked up from the manifold table, which therefore 
+requires the table to include an `HRR` column (volumetric heat release rate, in the table's units). If the table has no `HRR` column 
+the reported integral is zero. Additionally, if the `do_temporal` flag is activated, one can turn on state extremas 
+(stored in `temporals/tempExtremas` as min/max for each state entry), mass balance (stored in `temporals/tempMass`) computing the total mass, dMdt and advective mass fluxes across the domain boundaries as well as the error in
 the balance (dMdt - sum of fluxes), and species balance (stored in `temporals/tempSpec`) computing each species total mass, dM_Ydt,
 advective \& diffusive fluxes across the domain boundaries, consumption rate integral and the error (dMdt - sum of fluxes - reaction).
 Users can also monitor species advective fluxes through specific regions of the domain boundaries (called as boundary patches).
