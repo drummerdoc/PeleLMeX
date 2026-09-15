@@ -116,7 +116,6 @@ Current Roster
 - Fabrizio Bisetti
 - Suo Yang
 - Heinz Pitsch
-- Thierry Pionsot
 - Andrew Aspden
 - Andrea Gruber
 - Jackie Chen
