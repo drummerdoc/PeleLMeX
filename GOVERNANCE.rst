@@ -16,6 +16,7 @@ Current Roster
 - Bruce Perry
 - Jackie Chen
 - John Bell
+- David Montgomery
 
 See: `GitHub team <https://github.com/orgs/AMReX-Combustion/teams/pele-steering-committee>`__
 
@@ -70,6 +71,7 @@ Current Roster
 - Lucas Esclapez
 - Andy Nonaka
 - Ann Almgren
+- Jon Rood
 
 See: `GitHub team <https://github.com/orgs/AMReX-Combustion/teams/pele-technical-committee>`__
 
