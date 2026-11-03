@@ -1,0 +1,26 @@
+#!/bin/bash
+set -e
+BASE=$1
+BRANCH=$2
+NP=${3:-32}
+FCOMPARE=${FCOMPARE:-../../../Submodules/PelePhysics/Submodules/amrex/Tools/Plotfile/fcompare.gnu.ex}
+for exe in base branch; do
+  for dt in dt1 dt2; do
+    d=run_${exe}_${dt}
+    rm -rf $d
+    mkdir $d
+    cd $d
+    if [ $exe = base ]; then E=../$BASE; else E=../$BRANCH; fi
+    mpirun -n $NP $E ../input.dtcompare_${dt} > run.log 2>&1
+    cd ..
+  done
+done
+{
+echo "=== branch vs base, dt = 1e-5"
+$FCOMPARE run_base_dt1/plt00020 run_branch_dt1/plt00020
+echo "=== branch vs base, dt = 5e-6"
+$FCOMPARE run_base_dt2/plt00040 run_branch_dt2/plt00040
+echo "=== base dt=1e-5 vs base dt=5e-6 (size of the time-step error itself)"
+$FCOMPARE run_base_dt1/plt00020 run_base_dt2/plt00040
+} > compare_dt.out 2>&1
+echo done
