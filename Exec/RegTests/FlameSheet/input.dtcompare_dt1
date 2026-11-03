@@ -26,7 +26,7 @@ prob.P_mean = 101325.0
 prob.standoff = -.023
 prob.pertmag = 0.00045
 prob.pertlength = 0.016
-pmf.datafile = "drm19_pmf.dat"
+pmf.datafile = "../drm19_pmf.dat"
 
 #---------------------- PeleLMeX CONTROL -------------------------
 peleLM.v = 1                              # PeleLMeX verbose
