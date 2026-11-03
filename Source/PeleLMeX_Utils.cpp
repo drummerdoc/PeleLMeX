@@ -2,6 +2,7 @@
 #include <PeleLMeX.H>
 #include <PeleLMeX_K.H>
 #include <hydro_utils.H>
+#include <limits>
 #include <memory>
 #include <sstream>
 #ifdef PELE_USE_PLASMA
@@ -1682,6 +1683,89 @@ PeleLM::checkProjectionCompatibility(
         << ")";
     amrex::Abort(msg.str());
   }
+}
+
+void
+PeleLM::checkMACDivuMismatch(
+  const int a_lev,
+  const std::string& a_who,
+  const amrex::MultiFab& a_divu,
+  const amrex::Array<const amrex::MultiFab*, AMREX_SPACEDIM>& a_umac)
+{
+  // Diagnostic only.  Compares the divu handed to the Godunov prediction
+  // with the divergence of the face velocity it is paired with, in valid
+  // cells that are regular (no EB cut) and not covered by a finer level.
+  if (m_debug_divu_mismatch == 0 || m_incompressible != 0) {
+    return;
+  }
+  if (m_mesh_mapping || geom[a_lev].IsRZ()) {
+    amrex::Print() << "   ... DIVUCHECK " << a_who
+                   << ": skipped (mesh mapping or RZ)\n";
+    return;
+  }
+
+  const auto dxinv = geom[a_lev].InvCellSizeArray();
+  const bool has_mask = (a_lev != finest_level);
+  constexpr amrex::Real big = std::numeric_limits<amrex::Real>::max();
+
+  amrex::ReduceOps<
+    amrex::ReduceOpMax, amrex::ReduceOpMin, amrex::ReduceOpMax>
+    reduce_op;
+  amrex::ReduceData<amrex::Real, amrex::Real, amrex::Real> reduce_data(
+    reduce_op);
+  using ReduceTuple = typename decltype(reduce_data)::Type;
+
+  for (amrex::MFIter mfi(a_divu); mfi.isValid(); ++mfi) {
+    const amrex::Box& bx = mfi.validbox();
+    auto const& divu = a_divu.const_array(mfi);
+    AMREX_D_TERM(auto const& umac = a_umac[0]->const_array(mfi);
+                 , auto const& vmac = a_umac[1]->const_array(mfi);
+                 , auto const& wmac = a_umac[2]->const_array(mfi);)
+    auto const& mask = has_mask ? m_coveredMask[a_lev]->const_array(mfi)
+                                : amrex::Array4<int const>{};
+#ifdef AMREX_USE_EB
+    auto const& flag =
+      EBFactory(a_lev).getMultiEBCellFlagFab().const_array(mfi);
+#endif
+    reduce_op.eval(
+      bx, reduce_data,
+      [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept -> ReduceTuple {
+        bool use = true;
+        if (has_mask) {
+          use = (mask(i, j, k) != 0);
+        }
+#ifdef AMREX_USE_EB
+        use = use && flag(i, j, k).isRegular();
+#endif
+        if (!use) {
+          return {-big, big, amrex::Real(0.0)};
+        }
+        const amrex::Real divum = AMREX_D_TERM(
+          (umac(i + 1, j, k) - umac(i, j, k)) * dxinv[0],
+          +(vmac(i, j + 1, k) - vmac(i, j, k)) * dxinv[1],
+          +(wmac(i, j, k + 1) - wmac(i, j, k)) * dxinv[2]);
+        const amrex::Real d = divu(i, j, k) - divum;
+        return {d, d, std::abs(divu(i, j, k))};
+      });
+  }
+
+  ReduceTuple hv = reduce_data.value(reduce_op);
+  amrex::Real dmax = amrex::get<0>(hv);
+  amrex::Real dmin = amrex::get<1>(hv);
+  amrex::Real smax = amrex::get<2>(hv);
+  amrex::ParallelDescriptor::ReduceRealMax(dmax);
+  amrex::ParallelDescriptor::ReduceRealMin(dmin);
+  amrex::ParallelDescriptor::ReduceRealMax(smax);
+
+  if (dmax < -0.5 * big) {
+    amrex::Print() << "   ... DIVUCHECK lev " << a_lev << " " << a_who
+                   << ": no regular uncovered cells\n";
+    return;
+  }
+  amrex::Print().SetPrecision(10)
+    << "   ... DIVUCHECK lev " << a_lev << " " << a_who
+    << ": divu - div(umac): min = " << dmin << ", max = " << dmax
+    << ", max|divu| = " << smax << "\n";
 }
 
 amrex::Real
