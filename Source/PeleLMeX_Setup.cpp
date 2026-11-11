@@ -867,6 +867,11 @@ PeleLM::readParameters()
   ppnproj.query("atol", m_nodal_mg_atol);
   ppnproj.query("rtol", m_nodal_mg_rtol);
   ppnproj.query("hypre_namespace", m_hypre_namespace_nodal);
+  // Second-order nodal divergence at walls and inflow faces (AMReX
+  // MLNodeLaplacian::setWallDivuCorrection): the wall node's half-cell control
+  // volume is sampled a quarter cell from the wall instead of at the first
+  // cell centres.  Pairs with tensor_diffusion.max_order = 3.
+  ppnproj.query("wall_divu_correction", m_nodal_wall_divu_correction);
   m_nproj_verbose = amrex::max<int>(m_verbose - 2, 0);
   ppnproj.queryAdd("verbose", m_nproj_verbose);
 

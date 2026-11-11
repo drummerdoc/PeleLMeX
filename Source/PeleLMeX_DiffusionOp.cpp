@@ -2051,6 +2051,10 @@ DiffusionTensorOp::readParameters()
   pp.query("atol", m_mg_atol);
   pp.query("rtol", m_mg_rtol);
   pp.query("max_iter", m_mg_max_iter);
+  // Order of the ghost-cell extrapolation at Dirichlet (no-slip) walls.  At the
+  // default of 2 the wall stress is off by an O(1) factor in the wall cells; 3
+  // makes it second order there (see nodal_proj.wall_divu_correction).
+  pp.query("max_order", m_mg_maxorder);
   pp.query("bottom_solver", m_mg_bottom_solver);
   if (
     !m_mg_bottom_solver.empty() && isMatrixBottomSolver(parseBottomSolver(

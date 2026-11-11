@@ -807,6 +807,9 @@ PeleLM::doNodalProject(
   }
 
   nodal_projector->setDomainBC(lobc, hibc);
+  if (m_nodal_wall_divu_correction != 0) {
+    nodal_projector->getLinOp().setWallDivuCorrection(true);
+  }
 
 #ifdef AMREX_USE_EB
   if (m_useEBinflow != 0) {

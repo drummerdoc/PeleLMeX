@@ -2607,6 +2607,7 @@ private:
   // Nodal projection
   int m_nodal_mg_max_coarsening_level = 100;
   amrex::Real m_nodal_mg_rtol = 1.0e-11;
+  int m_nodal_wall_divu_correction = 0;
   amrex::Real m_nodal_mg_atol = 1.0e-14;
   std::string m_hypre_namespace_nodal = "nodal_hypre";
 
